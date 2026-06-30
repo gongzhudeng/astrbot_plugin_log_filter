@@ -1,8 +1,8 @@
 """
 Log filter plugin for AstrBot.
 
-Injects a logging.Filter into the root logger that suppresses all log lines
-produced by sessions that are NOT in the platform whitelist.
+Injects a logging.Filter into the "astrbot" (and root) logger handlers that
+suppresses log bursts produced by sessions NOT in the platform whitelist.
 
 Each rejected message generates a burst of ~6 consecutive log lines:
   1. [DBUG] aiocqhttp_platform_adapter  – RawMessage <Event, {'group_id': ...}>
@@ -24,8 +24,9 @@ from astrbot.api.event import filter
 from astrbot.api.star import Context, Star, register
 from astrbot.core.config.astrbot_config import AstrBotConfig
 
-# Regex to pull the group_id out of a RawMessage line.
+# Regexes to extract IDs from a RawMessage line.
 _GROUP_ID_RE = re.compile(r"'group_id':\s*(\d+)")
+_USER_ID_RE = re.compile(r"'user_id':\s*(\d+)")
 # Sentinel that marks the end of a pipeline burst.
 _PIPELINE_DONE = "pipeline 执行完毕"
 # Sentinel that marks a non-whitelist INFO line from whitelist_check.
@@ -38,14 +39,13 @@ class _NonWhitelistFilter(logging.Filter):
     def __init__(self) -> None:
         super().__init__()
         self._blocking: bool = False
-        # Populated by the plugin on init and on every config reload.
         self.platform_whitelist: set[str] = set()
         self.extra_blocklist: set[str] = set()
         self.extra_allowlist: set[str] = set()
         self.enabled: bool = True
 
     # ------------------------------------------------------------------
-    # public helpers for the plugin to push updated sets
+    # public helpers
     # ------------------------------------------------------------------
 
     def update_lists(
@@ -64,37 +64,40 @@ class _NonWhitelistFilter(logging.Filter):
     # internal helpers
     # ------------------------------------------------------------------
 
-    def _effective_whitelist(self) -> set[str]:
-        """Combine platform whitelist, removing explicitly blocked entries."""
-        wl = self.platform_whitelist - self.extra_blocklist
-        wl |= self.extra_allowlist
-        return wl
-
-    def _is_group_id_blocked(self, group_id_str: str) -> bool:
+    def _should_block_raw(self, msg: str) -> bool:
         """
-        Return True if this group_id should be filtered out.
+        Given a full RawMessage log line, decide whether this session is blocked.
 
-        Blocked when the ID appears in neither:
-          - the platform whitelist (numeric form)
-          - an explicit allowlist override
-        OR when it explicitly appears in extra_blocklist.
+        Group message : has group_id → match bare number or GroupMessage:xxx.
+        Friend message: no group_id, has user_id → match FriendMessage:xxx /
+                        platform:FriendMessage:xxx patterns.
         """
-        if group_id_str in self.extra_allowlist:
-            return False
-        if group_id_str in self.extra_blocklist:
-            return True
-        # If whitelist is empty AstrBot doesn't filter at all – don't filter here either.
         if not self.platform_whitelist:
+            # whitelist empty → AstrBot itself doesn't filter → pass everything
             return False
-        # Check both bare group_id and common unified_msg_origin patterns.
-        for pattern in (
-            group_id_str,
-            f"GroupMessage:{group_id_str}",
-        ):
+
+        group_m = _GROUP_ID_RE.search(msg)
+        user_m = _USER_ID_RE.search(msg)
+
+        if group_m:
+            gid = group_m.group(1)
+            candidates = (gid, f"GroupMessage:{gid}")
+        elif user_m:
+            uid = user_m.group(1)
+            candidates = (uid, f"FriendMessage:{uid}", f"default:FriendMessage:{uid}")
+        else:
+            return False  # can't determine session → pass
+
+        for candidate in candidates:
+            if candidate in self.extra_allowlist:
+                return False
+            if candidate in self.extra_blocklist:
+                return True
             for wl_entry in self.platform_whitelist:
-                if pattern in wl_entry or wl_entry == group_id_str:
+                if candidate in wl_entry or wl_entry == candidate:
                     return False
-        return True
+
+        return True  # not found in whitelist → block
 
     # ------------------------------------------------------------------
     # core filter method
@@ -109,13 +112,11 @@ class _NonWhitelistFilter(logging.Filter):
         except Exception:
             return True
 
-        # --- Detect burst start: the RawMessage line from the adapter ---
+        # --- Detect burst start: RawMessage line from the adapter ---
         if "RawMessage" in msg:
-            m = _GROUP_ID_RE.search(msg)
-            if m and self._is_group_id_blocked(m.group(1)):
+            if self._should_block_raw(msg):
                 self._blocking = True
                 return False
-            # Recognised RawMessage but not blocked – ensure flag is clear.
             self._blocking = False
             return True
 
@@ -125,8 +126,7 @@ class _NonWhitelistFilter(logging.Filter):
                 self._blocking = False
             return False
 
-        # --- Suppress the whitelist-check INFO line even outside a burst
-        #     (edge case: filter was reloaded mid-burst).
+        # --- Suppress whitelist-check INFO line even outside a burst ---
         if _WHITELIST_BLOCKED in msg:
             return False
 
@@ -154,28 +154,42 @@ class LogFilterPlugin(Star):
     # ------------------------------------------------------------------
 
     def _install_filter(self) -> None:
-        root = logging.getLogger()
-        # Avoid double-installing if the plugin is hot-reloaded.
-        for existing in root.filters:
-            if isinstance(existing, _NonWhitelistFilter):
-                self._filter = existing
-                return
-        root.addFilter(self._filter)
+        # "astrbot" logger has propagate=False, so its handlers never reach root.
+        # aiocqhttp.* loggers propagate=True and reach root handlers.
+        # Attach the same filter instance to ALL handlers on both so the shared
+        # _blocking flag is consistent across both log paths.
+        count = 0
+        for logger_name in (None, "astrbot"):
+            target = logging.getLogger() if logger_name is None else logging.getLogger(logger_name)
+            for handler in target.handlers:
+                existing = next(
+                    (f for f in handler.filters if isinstance(f, _NonWhitelistFilter)),
+                    None,
+                )
+                if existing is not None:
+                    self._filter = existing  # hot-reload: reuse to preserve _blocking state
+                else:
+                    handler.addFilter(self._filter)
+                    count += 1
+        logger.info(f"[日志过滤器] filter 已安装到 {count} 个 handler")
 
     def _remove_filter(self) -> None:
-        root = logging.getLogger()
-        root.filters = [f for f in root.filters if not isinstance(f, _NonWhitelistFilter)]
+        for logger_name in (None, "astrbot"):
+            target = logging.getLogger() if logger_name is None else logging.getLogger(logger_name)
+            for handler in target.handlers:
+                handler.filters = [
+                    f for f in handler.filters if not isinstance(f, _NonWhitelistFilter)
+                ]
 
     # ------------------------------------------------------------------
     # whitelist sync
     # ------------------------------------------------------------------
 
     def _reload_lists(self) -> None:
-        """Pull the current platform whitelist from AstrBot config."""
         try:
+            cfg = self.context.get_config()
             platform_whitelist: list = (
-                self.context.astrbot_config
-                .get("platform_settings", {})
+                cfg.get("platform_settings", {})
                 .get("id_whitelist", [])
             )
         except Exception:
@@ -191,6 +205,7 @@ class LogFilterPlugin(Star):
             extra_allowlist=extra_allowlist,
             enabled=enabled,
         )
+        logger.info(f"[日志过滤器] 白名单已同步: {sorted(self._filter.platform_whitelist)}")
 
     # ------------------------------------------------------------------
     # commands
