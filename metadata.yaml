@@ -1,0 +1,8 @@
+name: astrbot_plugin_log_filter
+display_name: 日志过滤器
+desc: >
+  过滤非白名单会话产生的日志噪音。自动同步 AstrBot 平台白名单，
+  将不在白名单内的群聊消息所触发的全部日志行静默屏蔽，保持日志整洁。
+version: 1.0.0
+author: 灵犀
+repo: https://github.com/gongzhudeng/astrbot_plugin_log_filter

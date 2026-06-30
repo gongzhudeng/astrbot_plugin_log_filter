@@ -1,0 +1,38 @@
+{
+    "基础配置": {
+        "description": "日志过滤器基础配置",
+        "type": "object",
+        "items": {
+            "enabled": {
+                "description": "启用插件",
+                "hint": "关闭后停止所有过滤，恢复原始日志输出",
+                "type": "bool",
+                "default": true
+            }
+        }
+    },
+    "额外屏蔽列表": {
+        "description": "在平台白名单基础上，额外手动屏蔽指定会话的日志",
+        "type": "object",
+        "items": {
+            "extra_blocklist": {
+                "description": "额外屏蔽的会话 ID 或群号",
+                "hint": "填写群号（如 215532038）或完整 session ID（如 default:GroupMessage:215532038）。即使这些 ID 在平台白名单里，也会被屏蔽。",
+                "type": "list",
+                "default": []
+            }
+        }
+    },
+    "强制放行列表": {
+        "description": "强制放行指定会话的日志，优先级高于所有屏蔽规则",
+        "type": "object",
+        "items": {
+            "extra_allowlist": {
+                "description": "强制放行的会话 ID 或群号",
+                "hint": "填写群号或完整 session ID。这些 ID 的日志一定会显示，适合调试特定会话。",
+                "type": "list",
+                "default": []
+            }
+        }
+    }
+}
